@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Optional,
@@ -254,6 +255,7 @@ class AIScientistFramework:
         tournament_size: int = 8,
         hypotheses_per_generation: int = 10,
         evolution_top_k: int = 3,
+        max_tokens: int = 4000,
     ) -> None:
         """Initialize the AIScientistFramework system with configuration parameters."""
         # Type validation
@@ -272,6 +274,7 @@ class AIScientistFramework:
 
         self.model_name: str = model_name
         self.max_iterations: int = max_iterations
+        self.max_tokens: int = max_tokens
         self.base_path: Path = (
             Path(base_path)
             if base_path
@@ -314,6 +317,7 @@ class AIScientistFramework:
                 system_prompt=self._get_generation_agent_prompt(),
                 model_name=self.model_name,
                 max_loops=1,
+                max_tokens=self.max_tokens,
                 saved_state_path=str(
                     self.base_path / "generation_agent_state.json"
                 ),
@@ -324,6 +328,7 @@ class AIScientistFramework:
                 system_prompt=self._get_reflection_agent_prompt(),
                 model_name=self.model_name,
                 max_loops=1,
+                max_tokens=self.max_tokens,
                 saved_state_path=str(
                     self.base_path / "reflection_agent_state.json"
                 ),
@@ -334,6 +339,7 @@ class AIScientistFramework:
                 system_prompt=self._get_ranking_agent_prompt(),
                 model_name=self.model_name,
                 max_loops=1,
+                max_tokens=self.max_tokens,
                 saved_state_path=str(
                     self.base_path / "ranking_agent_state.json"
                 ),
@@ -344,6 +350,7 @@ class AIScientistFramework:
                 system_prompt=self._get_evolution_agent_prompt(),
                 model_name=self.model_name,
                 max_loops=1,
+                max_tokens=self.max_tokens,
                 saved_state_path=str(
                     self.base_path / "evolution_agent_state.json"
                 ),
@@ -354,6 +361,7 @@ class AIScientistFramework:
                 system_prompt=self._get_meta_review_agent_prompt(),
                 model_name=self.model_name,
                 max_loops=1,
+                max_tokens=self.max_tokens,
                 saved_state_path=str(
                     self.base_path / "meta_review_agent_state.json"
                 ),
@@ -364,6 +372,7 @@ class AIScientistFramework:
                 system_prompt=self._get_proximity_agent_prompt(),
                 model_name=self.model_name,
                 max_loops=1,
+                max_tokens=self.max_tokens,
                 saved_state_path=str(
                     self.base_path / "proximity_agent_state.json"
                 ),
@@ -374,6 +383,7 @@ class AIScientistFramework:
                 system_prompt=self._get_tournament_agent_prompt(),
                 model_name=self.model_name,
                 max_loops=1,
+                max_tokens=self.max_tokens,
                 saved_state_path=str(
                     self.base_path / "tournament_agent_state.json"
                 ),
@@ -384,6 +394,7 @@ class AIScientistFramework:
                 system_prompt=self._get_supervisor_agent_prompt(),
                 model_name=self.model_name,
                 max_loops=1,
+                max_tokens=self.max_tokens,
                 saved_state_path=str(
                     self.base_path / "supervisor_agent_state.json"
                 ),
@@ -975,13 +986,14 @@ Example JSON Output:
         )
 
     def _run_generation_phase(
-        self, research_goal: str
+        self, research_goal: str, progress_callback: Optional[Callable[[str, str], None]] = None
     ) -> List[Hypothesis]:
         """
         Run the hypothesis generation phase.
 
         Args:
             research_goal: The research goal to generate hypotheses for
+            progress_callback: Optional callback for progress updates
 
         Returns:
             List of generated hypotheses
@@ -1014,6 +1026,10 @@ Example JSON Output:
             json.dumps(supervisor_input)
         )
 
+        # Call progress callback with supervisor output
+        if progress_callback:
+            progress_callback("Supervisor", supervisor_response)
+
         # Handle empty responses from supervisor agent
         if not supervisor_response or not supervisor_response.strip():
             logger.warning(
@@ -1041,6 +1057,10 @@ Example JSON Output:
         generation_response = self.generation_agent.run(
             json.dumps(generation_input)
         )
+
+        # Call progress callback with generation output
+        if progress_callback:
+            progress_callback("HypothesisGenerator", generation_response)
 
         # Handle empty responses from agent
         if not generation_response or not generation_response.strip():
@@ -1142,13 +1162,14 @@ Example JSON Output:
         return hypotheses
 
     def _run_reflection_phase(
-        self, hypotheses: List[Hypothesis]
+        self, hypotheses: List[Hypothesis], progress_callback: Optional[Callable[[str, str], None]] = None
     ) -> List[Hypothesis]:
         """
         Run the hypothesis reflection (review) phase.
 
         Args:
             hypotheses: List of hypotheses to review
+            progress_callback: Optional callback for progress updates
 
         Returns:
             List of reviewed hypotheses
@@ -1182,9 +1203,32 @@ Example JSON Output:
                 logger.debug(
                     f"Reviewing hypothesis {i+1}/{len(hypotheses)}"
                 )
+
+                # Reinitialize the reflection agent for each hypothesis to prevent state accumulation
+                self.reflection_agent = Agent(
+                    agent_name="HypothesisReflector",
+                    system_prompt=self._get_reflection_agent_prompt(),
+                    model_name=self.model_name,
+                    max_loops=1,
+                    max_tokens=self.max_tokens,
+                    saved_state_path=str(
+                        self.base_path / "reflection_agent_state.json"
+                    ),
+                    verbose=self.verbose,
+                )
+
                 review_response = self.reflection_agent.run(
                     json.dumps(review_input)
                 )
+
+                # Delete state file after each review to prevent history accumulation
+                reflection_state_path = self.base_path / "reflection_agent_state.json"
+                if reflection_state_path.exists():
+                    reflection_state_path.unlink()
+
+                # Call progress callback with reflection output
+                if progress_callback:
+                    progress_callback("HypothesisReflector", review_response)
 
                 # Handle empty responses from reflection agent
                 if not review_response or not review_response.strip():
@@ -1244,13 +1288,14 @@ Example JSON Output:
         return reviewed_hypotheses
 
     def _run_ranking_phase(
-        self, reviewed_hypotheses: List[Hypothesis]
+        self, reviewed_hypotheses: List[Hypothesis], progress_callback: Optional[Callable[[str, str], None]] = None
     ) -> List[Hypothesis]:
         """
         Run the hypothesis ranking phase.
 
         Args:
             reviewed_hypotheses: List of reviewed hypotheses to rank
+            progress_callback: Optional callback for progress updates
 
         Returns:
             List of ranked hypotheses
@@ -1276,6 +1321,11 @@ Example JSON Output:
         ranking_response = self.ranking_agent.run(
             json.dumps({"hypotheses_for_ranking": ranking_input})
         )
+
+        # Call progress callback with ranking output
+        if progress_callback:
+            progress_callback("HypothesisRanker", ranking_response)
+
         self.conversation.add(
             role=self.ranking_agent.agent_name,
             content=ranking_response,
@@ -1331,6 +1381,7 @@ Example JSON Output:
         self,
         top_hypotheses: List[Hypothesis],
         meta_review_data: Dict[str, Any],
+        progress_callback: Optional[Callable] = None,
     ) -> List[Hypothesis]:
         """
         Run the hypothesis evolution phase.
@@ -1338,6 +1389,7 @@ Example JSON Output:
         Args:
             top_hypotheses: List of top hypotheses to evolve
             meta_review_data: Meta-review insights for evolution guidance
+            progress_callback: Optional callback for progress updates
 
         Returns:
             List of evolved hypotheses
@@ -1387,6 +1439,10 @@ Example JSON Output:
                 evolution_response = self.evolution_agent.run(
                     json.dumps(evolution_input)
                 )
+
+                # Call progress callback with evolution output
+                if progress_callback:
+                    progress_callback("HypothesisEvolver", evolution_response)
 
                 # Fallback if evolution agent returns nothing
                 if (
@@ -1460,13 +1516,14 @@ Example JSON Output:
         return evolved_hypotheses
 
     def _run_meta_review_phase(
-        self, reviewed_hypotheses: List[Hypothesis]
+        self, reviewed_hypotheses: List[Hypothesis], progress_callback: Optional[Callable] = None
     ) -> Dict[str, Any]:
         """
         Run the meta-review phase to synthesize insights from reviews.
 
         Args:
             reviewed_hypotheses: List of hypotheses with reviews
+            progress_callback: Optional callback for progress updates
 
         Returns:
             Meta-review insights and recommendations
@@ -1503,6 +1560,11 @@ Example JSON Output:
         meta_review_response = self.meta_review_agent.run(
             json.dumps({"reviews": all_reviews_for_meta})
         )
+
+        # Call progress callback with meta-review output
+        if progress_callback:
+            progress_callback("MetaReviewer", meta_review_response)
+
         self.conversation.add(
             role=self.meta_review_agent.agent_name,
             content=meta_review_response,
@@ -1526,13 +1588,14 @@ Example JSON Output:
         return meta_review_data
 
     def _run_proximity_analysis_phase(
-        self, hypotheses: List[Hypothesis]
+        self, hypotheses: List[Hypothesis], progress_callback: Optional[Callable] = None
     ) -> List[Hypothesis]:
         """
         Run proximity analysis to cluster similar hypotheses.
 
         Args:
             hypotheses: List of hypotheses to analyze for similarity
+            progress_callback: Optional callback for progress updates
 
         Returns:
             List of hypotheses with cluster assignments
@@ -1566,6 +1629,11 @@ Example JSON Output:
         proximity_response = self.proximity_agent.run(
             json.dumps({"hypotheses_texts": hypothesis_texts})
         )
+
+        # Call progress callback with proximity analysis output
+        if progress_callback:
+            progress_callback("ProximityAnalyzer", proximity_response)
+
         self.conversation.add(
             role=self.proximity_agent.agent_name,
             content=proximity_response,
@@ -1585,8 +1653,10 @@ Example JSON Output:
             f"Found {len(similarity_clusters)} similarity clusters"
         )
 
-        # Assign cluster IDs to hypotheses
+        # Assign cluster IDs to hypotheses and track high-similarity clusters
         clusters_assigned = 0
+        high_similarity_clusters = set()  # Track clusters with high similarity for deduplication
+
         for cluster in similarity_clusters:
             if not isinstance(cluster, dict):
                 logger.warning(
@@ -1596,6 +1666,19 @@ Example JSON Output:
 
             cluster_id = cluster.get("cluster_id", "no_cluster_id")
             similar_hypotheses = cluster.get("similar_hypotheses", [])
+
+            # Check if this cluster contains high similarity hypotheses (duplicates)
+            has_high_similarity = False
+            for hy_data in similar_hypotheses:
+                if isinstance(hy_data, dict) and hy_data.get("similarity_degree") == "high":
+                    has_high_similarity = True
+                    break
+
+            if has_high_similarity and len(similar_hypotheses) > 1:
+                high_similarity_clusters.add(cluster_id)
+                logger.debug(
+                    f"Cluster {cluster_id} marked for deduplication (high similarity, {len(similar_hypotheses)} hypotheses)"
+                )
 
             for hy_text_data in similar_hypotheses:
                 # Handle different formats for hypothesis text
@@ -1618,20 +1701,56 @@ Example JSON Output:
                             )
                             break
 
+        # Deduplicate high-similarity clusters - keep only the best hypothesis from each cluster
+        deduplicated_hypotheses = []
+        removed_count = 0
+
+        # Group hypotheses by cluster
+        cluster_groups: Dict[str, List[Hypothesis]] = {}
+        for hy in hypotheses:
+            cluster_id = hy.similarity_cluster_id
+            if cluster_id and cluster_id in high_similarity_clusters:
+                if cluster_id not in cluster_groups:
+                    cluster_groups[cluster_id] = []
+                cluster_groups[cluster_id].append(hy)
+            else:
+                # Keep hypotheses not in high-similarity clusters
+                deduplicated_hypotheses.append(hy)
+
+        # For each high-similarity cluster, keep only the best hypothesis
+        for cluster_id, cluster_hypotheses in cluster_groups.items():
+            if len(cluster_hypotheses) > 1:
+                # Sort by Elo rating (primary) and score (secondary)
+                cluster_hypotheses.sort(
+                    key=lambda h: (h.elo_rating, h.score), reverse=True
+                )
+                best_hypothesis = cluster_hypotheses[0]
+                deduplicated_hypotheses.append(best_hypothesis)
+                removed_count += len(cluster_hypotheses) - 1
+                logger.info(
+                    f"Cluster {cluster_id}: Kept best hypothesis (Elo: {best_hypothesis.elo_rating}, Score: {best_hypothesis.score:.2f}), "
+                    f"removed {len(cluster_hypotheses) - 1} duplicate(s)"
+                )
+            else:
+                # Single hypothesis in cluster, keep it
+                deduplicated_hypotheses.append(cluster_hypotheses[0])
+
         self._time_execution("proximity_analysis", start_time)
         logger.success(
-            f"Proximity analysis completed. {clusters_assigned} cluster assignments made"
+            f"Proximity analysis completed. {clusters_assigned} cluster assignments made, "
+            f"{removed_count} duplicate(s) removed from {len(high_similarity_clusters)} high-similarity cluster(s)"
         )
-        return hypotheses
+        return deduplicated_hypotheses
 
     def _run_tournament_phase(
-        self, hypotheses: List[Hypothesis]
+        self, hypotheses: List[Hypothesis], progress_callback: Optional[Callable] = None
     ) -> List[Hypothesis]:
         """
         Run tournament selection and Elo rating update.
 
         Args:
             hypotheses: List of hypotheses to compete in tournament
+            progress_callback: Optional callback for progress updates
 
         Returns:
             List of hypotheses sorted by Elo rating
@@ -1683,9 +1802,33 @@ Example JSON Output:
                 logger.debug(
                     f"Tournament round {round_num+1}/{tournament_rounds}"
                 )
+
+                # Reinitialize the tournament agent for each round to prevent state accumulation
+                self.tournament_agent = Agent(
+                    agent_name="TournamentJudge",
+                    system_prompt=self._get_tournament_agent_prompt(),
+                    model_name=self.model_name,
+                    max_loops=1,
+                    max_tokens=self.max_tokens,
+                    saved_state_path=str(
+                        self.base_path / "tournament_agent_state.json"
+                    ),
+                    verbose=self.verbose,
+                )
+
                 tournament_response = self.tournament_agent.run(
                     json.dumps(tournament_input)
                 )
+
+                # Delete state file after each round to prevent history accumulation
+                tournament_state_path = self.base_path / "tournament_agent_state.json"
+                if tournament_state_path.exists():
+                    tournament_state_path.unlink()
+
+                # Call progress callback with tournament judgment
+                if progress_callback:
+                    progress_callback("TournamentJudge", tournament_response)
+
                 self.conversation.add(
                     role=self.tournament_agent.agent_name,
                     content=tournament_response,
@@ -1764,13 +1907,14 @@ Example JSON Output:
         return hypotheses
 
     def run_research_workflow(
-        self, research_goal: str
+        self, research_goal: str, progress_callback: Optional[Callable[[str, str], None]] = None
     ) -> WorkflowResult:
         """
         Execute the AI co-scientist research workflow to generate and refine hypotheses.
 
         Args:
             research_goal: The research goal provided by the scientist.
+            progress_callback: Optional callback function(agent_name, agent_output) called after each agent completes
 
         Returns:
             A dictionary containing the final results, including top-ranked hypotheses,
@@ -1803,20 +1947,20 @@ Example JSON Output:
         try:
             # --- Generation Phase ---
             self.hypotheses = self._run_generation_phase(
-                research_goal
+                research_goal, progress_callback
             )
 
             # --- Reflection Phase ---
             self.hypotheses = self._run_reflection_phase(
-                self.hypotheses
+                self.hypotheses, progress_callback
             )
 
             # --- Ranking Phase (Initial Ranking based on Reviews) ---
-            self.hypotheses = self._run_ranking_phase(self.hypotheses)
+            self.hypotheses = self._run_ranking_phase(self.hypotheses, progress_callback)
 
             # --- Tournament Phase (Elo-based Ranking) ---
             self.hypotheses = self._run_tournament_phase(
-                self.hypotheses
+                self.hypotheses, progress_callback
             )
 
             # --- Iterative Refinement Cycle ---
@@ -1828,7 +1972,7 @@ Example JSON Output:
 
                 # --- Meta-Review ---
                 meta_review_data = self._run_meta_review_phase(
-                    self.hypotheses
+                    self.hypotheses, progress_callback
                 )
 
                 # --- Evolution ---
@@ -1839,23 +1983,23 @@ Example JSON Output:
                     f"Evolving top {len(top_hypotheses_for_evolution)} hypotheses"
                 )
                 self.hypotheses = self._run_evolution_phase(
-                    top_hypotheses_for_evolution, meta_review_data
+                    top_hypotheses_for_evolution, meta_review_data, progress_callback
                 )
 
                 # Re-run Reflection and Ranking on evolved hypotheses
                 self.hypotheses = self._run_reflection_phase(
-                    self.hypotheses
+                    self.hypotheses, progress_callback
                 )
                 self.hypotheses = self._run_ranking_phase(
-                    self.hypotheses
+                    self.hypotheses, progress_callback
                 )
                 self.hypotheses = self._run_tournament_phase(
-                    self.hypotheses
+                    self.hypotheses, progress_callback
                 )  # Tournament after evolution too
 
                 # --- Proximity Analysis (after evolution and ranking each iteration) ---
                 self.hypotheses = self._run_proximity_analysis_phase(
-                    self.hypotheses
+                    self.hypotheses, progress_callback
                 )
 
                 logger.success(f"Completed iteration {iteration + 1}")
