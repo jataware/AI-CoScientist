@@ -3,11 +3,10 @@ from ai_coscientist import AIScientistFramework
 
 ai_coscientist = AIScientistFramework(
     model_name="gemini/gemini-2.0-flash",  # Or "gemini/gemini-2.0-flash" if you have access
-    max_iterations=2,  # Reduced iterations for example run
+    max_iterations=1,  # Optimized for performance (default)
     verbose=False,  # Set to True for detailed logs
-    hypotheses_per_generation=10,
-    tournament_size=8,
-    evolution_top_k=3,
+    hypotheses_per_generation=5,  # Optimized for performance (default)
+    evolution_top_k=2,  # Optimized for performance (default)
 )
 
 # Define a research goal
@@ -66,3 +65,11 @@ try:
     ai_coscientist.save_state()
 except Exception as e:
     print(f"Error saving state: {e}")
+
+# Analyze workflow logs
+print("\n" + "="*80)
+print("To analyze the workflow logs and check for issues (like duplicates), run:")
+print(f"  python analyze_workflow.py")
+print("\nOr to analyze a specific workflow:")
+print(f"  python analyze_workflow.py {ai_coscientist.workflow_log_dir}")
+print("="*80)

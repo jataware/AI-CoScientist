@@ -24,8 +24,87 @@ from dotenv import load_dotenv
 from swarms import Agent
 from swarms.structs.conversation import Conversation
 from loguru import logger
+import litellm
+import os
 
 load_dotenv()
+
+# Enable LangSmith logging using custom callbacks to avoid asyncio requirement
+# LangSmith's built-in litellm integration requires asyncio, which doesn't work
+# in thread pool contexts. Instead, we use custom callbacks with their sync API.
+
+def _setup_langsmith_logging():
+    """Configure LangSmith logging using custom callbacks."""
+    try:
+        # Only set up if LangSmith API key is present
+        if not os.getenv("LANGSMITH_API_KEY"):
+            logger.debug("LANGSMITH_API_KEY not set, skipping LangSmith logging")
+            return
+
+        from langsmith import Client
+        from datetime import datetime
+
+        langsmith_client = Client()
+        project_name = os.getenv("LANGSMITH_PROJECT")
+
+        def langsmith_success_handler(kwargs, response_obj, start_time, end_time):
+            """Log successful LLM calls to LangSmith."""
+            try:
+                model = kwargs.get("model", "unknown")
+                messages = kwargs.get("messages", [])
+
+                # Extract response content
+                response_text = ""
+                if hasattr(response_obj, "choices") and len(response_obj.choices) > 0:
+                    response_text = response_obj.choices[0].message.content
+                elif isinstance(response_obj, dict):
+                    response_text = response_obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+                # Create run in LangSmith
+                langsmith_client.create_run(
+                    name=f"litellm_{model}",
+                    run_type="llm",
+                    inputs={"messages": messages},
+                    outputs={"content": response_text},
+                    start_time=datetime.fromtimestamp(start_time),
+                    end_time=datetime.fromtimestamp(end_time),
+                    project_name=project_name,
+                    tags=["ai-coscientist", "litellm", model],
+                )
+            except Exception as e:
+                logger.debug(f"Failed to log to LangSmith: {e}")
+
+        def langsmith_failure_handler(kwargs, response_obj, start_time, end_time):
+            """Log failed LLM calls to LangSmith."""
+            try:
+                model = kwargs.get("model", "unknown")
+                messages = kwargs.get("messages", [])
+
+                langsmith_client.create_run(
+                    name=f"litellm_{model}",
+                    run_type="llm",
+                    inputs={"messages": messages},
+                    error=str(response_obj),
+                    start_time=datetime.fromtimestamp(start_time),
+                    end_time=datetime.fromtimestamp(end_time),
+                    project_name=project_name,
+                    tags=["ai-coscientist", "litellm", model, "error"],
+                )
+            except Exception as e:
+                logger.debug(f"Failed to log error to LangSmith: {e}")
+
+        # Set litellm callbacks using function references (not strings)
+        litellm.success_callback = [langsmith_success_handler]
+        litellm.failure_callback = [langsmith_failure_handler]
+        logger.info(f"LangSmith logging enabled for project: {project_name}")
+
+    except ImportError:
+        logger.debug("langsmith package not installed, skipping LangSmith logging")
+    except Exception as e:
+        logger.warning(f"Failed to configure LangSmith logging: {e}")
+
+# Initialize LangSmith logging at module import
+_setup_langsmith_logging()
 
 
 class AgentRole(Enum):
@@ -241,21 +320,20 @@ class AIScientistFramework:
         verbose (bool): Enable verbose logging.
         conversation (Conversation): Tracks the conversation history.
         hypotheses (List[Hypothesis]): List to store generated hypotheses.
-        tournament_size (int): Number of hypotheses to include in each tournament round.
         hypotheses_per_generation (int): Number of hypotheses to generate initially.
         evolution_top_k (int): Number of top hypotheses to evolve in each iteration.
     """
 
     def __init__(
         self,
-        model_name: str = "gpt-4.1",
-        max_iterations: int = 3,
+        model_name: str = "gpt-5",
+        max_iterations: int = 1,
         base_path: Optional[str] = None,
         verbose: bool = False,
-        tournament_size: int = 8,
-        hypotheses_per_generation: int = 10,
-        evolution_top_k: int = 3,
+        hypotheses_per_generation: int = 5,
+        evolution_top_k: int = 2,
         max_tokens: int = 4000,
+        save_workflow_logs: bool = True,
     ) -> None:
         """Initialize the AIScientistFramework system with configuration parameters."""
         # Type validation
@@ -285,12 +363,16 @@ class AIScientistFramework:
         self.conversation: Conversation = Conversation()
         self.hypotheses: List[Hypothesis] = []
 
-        # Tournament and evolution parameters
-        self.tournament_size: int = tournament_size
+        # Evolution parameters
         self.hypotheses_per_generation: int = (
             hypotheses_per_generation
         )
         self.evolution_top_k: int = evolution_top_k
+
+        # Workflow logging
+        self.save_workflow_logs: bool = save_workflow_logs
+        self.workflow_log_dir: Optional[Path] = None
+        self.removed_duplicates: List[Dict[str, Any]] = []  # Track removed duplicates
 
         # Execution metrics
         self.start_time: Optional[float] = None
@@ -417,6 +499,13 @@ Focus on generating hypotheses that are:
 - Potentially testable and falsifiable
 - Scientifically sound
 - Specific and well-defined
+- ⚠️ DIVERSE: Each hypothesis must explore a DIFFERENT approach, methodology, or variable
+
+CRITICAL: MAXIMIZE DIVERSITY
+⚠️ Generate hypotheses that explore DIFFERENT approaches to the research goal
+⚠️ Use DIFFERENT methodologies, biomarkers, techniques, or theoretical frameworks
+⚠️ Avoid generating similar or redundant hypotheses
+⚠️ If the research goal could be addressed from multiple angles (e.g., different biomarkers, different detection methods, different populations), ensure you cover that diversity
 
 Each hypothesis should:
 1. Challenge existing assumptions or extend current knowledge in the field
@@ -424,6 +513,7 @@ Each hypothesis should:
 3. Identify potential variables and relationships
 4. Consider practical implications and significance
 5. Balance ambition with feasibility
+6. Explore a UNIQUE angle or approach compared to the other hypotheses you generate
 
 Output your hypotheses in JSON format. Provide a list of hypotheses, each with a clear and concise text description,
 and brief justification explaining why it's novel and significant.
@@ -534,38 +624,52 @@ Example JSON Output:
         """Prompt for the Hypothesis Evolution Agent (Refiner)."""
         return """You are a Hypothesis Evolution Agent. Your task is to refine and improve the top-ranked research hypotheses based on the reviews and meta-review insights.
 
+CRITICAL REQUIREMENTS FOR PRESERVING DIVERSITY:
+⚠️ DO NOT rewrite hypotheses from scratch or replace them with completely different ideas
+⚠️ PRESERVE the unique core concept and approach of each hypothesis
+⚠️ Each hypothesis must remain DISTINCT from the others - do not make them similar or converge to the same solution
+⚠️ REFINE the existing hypothesis by making targeted improvements, not wholesale replacements
+⚠️ Maintain the original biomarker type, methodology, or detection approach that makes each hypothesis unique
+
 For each hypothesis, carefully analyze the review feedback, meta-review insights, and then apply the following approaches to refine the hypothesis:
 
 1. Enhance clarity and precision:
-   - Eliminate ambiguous language
-   - Ensure clear definition of variables and relationships
-   - Improve the logical structure
+   - Eliminate ambiguous language WHILE keeping the core concept intact
+   - Ensure clear definition of variables and relationships specific to THIS hypothesis
+   - Improve the logical structure without changing the fundamental approach
 
 2. Strengthen scientific soundness:
-   - Address any identified theoretical weaknesses
+   - Address any identified theoretical weaknesses in the ORIGINAL hypothesis
    - Ensure alignment with established scientific principles
-   - Incorporate relevant background knowledge
+   - Incorporate relevant background knowledge that supports THIS SPECIFIC approach
 
 3. Increase novelty and originality:
-   - Identify opportunities to introduce more innovative elements
-   - Consider unconventional perspectives or approaches
+   - Identify opportunities to make THIS hypothesis more innovative
+   - Consider unconventional perspectives WITHIN the context of this hypothesis's approach
+   - DO NOT borrow concepts from other hypotheses
 
 4. Improve testability:
-   - Make the hypothesis more amenable to empirical investigation
-   - Consider specific experimental designs or methodologies
-   - Ensure falsifiability
+   - Make THIS specific hypothesis more amenable to empirical investigation
+   - Specify experimental designs appropriate to THIS hypothesis's unique methodology
+   - Ensure falsifiability while maintaining the original approach
 
 5. Address safety/ethical concerns:
-   - Integrate ethical considerations
+   - Integrate ethical considerations relevant to THIS hypothesis
    - Propose safeguards or limitations when necessary
 
-6. Consider hybridization:
-   - Identify complementary hypotheses that could be combined
-   - Merge strengths from multiple hypotheses when beneficial
+6. AVOID inappropriate hybridization:
+   - DO NOT merge this hypothesis with unrelated approaches
+   - Only combine ideas if they genuinely complement the ORIGINAL hypothesis
+   - Preserve what makes this hypothesis DIFFERENT from others
 
 7. Simplify when appropriate:
-   - Remove unnecessary complexity
-   - Focus on the most promising and impactful aspects
+   - Remove unnecessary complexity from THIS hypothesis
+   - Focus on the most promising aspects of THIS SPECIFIC approach
+
+DIVERSITY CHECK: Before finalizing, ask yourself:
+- Does the refined hypothesis still address the SAME biomarker/approach as the original?
+- Is it still meaningfully DIFFERENT from the other hypotheses being refined?
+- Have I preserved what made this hypothesis UNIQUE?
 
 Output the refined hypotheses in JSON format, including the original text, the refined text, a summary of changes made, and justifications for each significant modification:
 
@@ -610,16 +714,21 @@ Analyze all the reviews provided by the Reflection Agents across multiple hypoth
    - High-level directions for improving hypothesis quality
    - Specific areas where the evolution agent should focus
    - Potential new directions or perspectives to explore
+   - ⚠️ IMPORTANT: Provide DISTINCT recommendations for each hypothesis to preserve diversity
+   - ⚠️ DO NOT give the same generic advice to all hypotheses - tailor guidance to each unique approach
 
 4. Assess the overall research direction:
    - Alignment with the original research goal
    - Potential for scientific impact
    - Most promising avenues for further exploration
+   - ⚠️ Value diversity: Multiple different approaches are better than converging to one "best" solution
 
 5. Identify potential connections:
    - Relationships between different hypotheses
-   - Possibilities for synthesizing complementary ideas
+   - Possibilities for synthesizing complementary ideas ONLY when truly beneficial
    - Cross-cutting themes or approaches
+   - ⚠️ WARNING: Avoid recommending synthesis that would make hypotheses too similar or identical
+   - Preserve distinct methodologies and biomarker types across hypotheses
 
 Output your meta-review insights and recommendations in JSON format:
 
@@ -675,12 +784,19 @@ Example JSON Output:
 Your task is to identify hypotheses that are semantically similar or redundant to maintain diversity in the hypothesis pool.
 This helps in clustering related hypotheses and de-duplicating similar ones to ensure diversity in the generated set.
 
+CRITICAL: DUPLICATE DETECTION
+⚠️ FIRST, check for exact or near-exact duplicates:
+   - If hypotheses have identical or nearly identical text (>95% overlap), they MUST be marked as "high" similarity
+   - If hypotheses use the same biomarker/methodology with only minor wording differences, mark as "high" similarity
+   - Exact duplicates are a CRITICAL issue that must be flagged for removal
+
 For each hypothesis, analyze:
-1. Core scientific concepts and principles involved
-2. Key variables and relationships being examined
-3. Underlying assumptions and theoretical frameworks
-4. Methodological approaches suggested or implied
-5. Potential applications or implications
+1. Text similarity: Are the hypotheses identical or near-identical in wording?
+2. Core scientific concepts and principles involved
+3. Key variables and relationships being examined (same biomarker type?)
+4. Underlying assumptions and theoretical frameworks
+5. Methodological approaches suggested or implied
+6. Potential applications or implications
 
 Based on these factors, identify clusters of hypotheses that are conceptually related or address similar research questions.
 Assign each hypothesis to a cluster, and give each cluster a descriptive name that captures its unifying theme.
@@ -688,8 +804,11 @@ Assign each hypothesis to a cluster, and give each cluster a descriptive name th
 For each cluster, identify:
 - The central theme or concept
 - The distinguishing features between hypotheses within the cluster
-- The degree of similarity/redundancy between hypotheses (high, medium, low)
-- Potential for synthesis or combination within the cluster
+- The degree of similarity/redundancy between hypotheses:
+  * "high" = Identical/near-identical text OR same core concept with trivial differences (MUST BE DEDUPLICATED)
+  * "medium" = Similar concepts but different methodologies or variables (related but distinct)
+  * "low" = Same general theme but clearly different approaches (diverse within cluster)
+- Potential for synthesis or combination within the cluster (only if not already duplicates)
 
 Output your findings in JSON format:
 
@@ -984,6 +1103,41 @@ Example JSON Output:
         logger.debug(
             f"Agent {agent_name} execution time: {execution_time:.2f}s (avg: {metrics['avg_time']:.2f}s)"
         )
+
+    def _save_workflow_snapshot(
+        self, phase_name: str, additional_data: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Save a snapshot of the current workflow state to disk.
+
+        Args:
+            phase_name: Name of the current phase (e.g., "01_generation", "02_reflection")
+            additional_data: Optional additional data to save with this snapshot
+        """
+        if not self.save_workflow_logs or not self.workflow_log_dir:
+            return
+
+        try:
+            snapshot = {
+                "phase": phase_name,
+                "timestamp": time.time(),
+                "hypotheses": [h.to_dict() for h in self.hypotheses],
+                "hypothesis_count": len(self.hypotheses),
+                "execution_metrics": self.execution_metrics,
+            }
+
+            if additional_data:
+                snapshot.update(additional_data)
+
+            # Save snapshot to file
+            snapshot_file = self.workflow_log_dir / f"{phase_name}.json"
+            with open(snapshot_file, "w") as f:
+                json.dump(snapshot, f, indent=2)
+
+            logger.debug(f"Saved workflow snapshot: {snapshot_file}")
+
+        except Exception as e:
+            logger.error(f"Failed to save workflow snapshot for {phase_name}: {e}")
 
     def _run_generation_phase(
         self, research_goal: str, progress_callback: Optional[Callable[[str, str], None]] = None
@@ -1510,6 +1664,27 @@ Example JSON Output:
         self.execution_metrics["evolutions_count"] += len(
             evolved_hypotheses
         )
+
+        # Check for duplicate hypotheses after evolution (early warning system)
+        hypothesis_texts = [h.text for h in evolved_hypotheses]
+        unique_texts = set(hypothesis_texts)
+        if len(hypothesis_texts) != len(unique_texts):
+            duplicates_count = len(hypothesis_texts) - len(unique_texts)
+            logger.warning(
+                f"⚠️  DIVERSITY ISSUE: Evolution created {duplicates_count} duplicate hypothesis/hypotheses! "
+                f"Expected {len(hypothesis_texts)} unique hypotheses, got {len(unique_texts)}. "
+                f"Proximity analysis will attempt deduplication."
+            )
+            # Log which hypotheses are duplicates
+            seen = set()
+            for i, text in enumerate(hypothesis_texts):
+                if text in seen:
+                    logger.warning(f"  - Hypothesis {i+1} is a duplicate: {text[:80]}...")
+                else:
+                    seen.add(text)
+        else:
+            logger.debug(f"✓ Diversity check passed: All {len(evolved_hypotheses)} evolved hypotheses are unique")
+
         logger.success(
             f"Evolution phase completed. {len(evolved_hypotheses)} hypotheses processed"
         )
@@ -1727,6 +1902,17 @@ Example JSON Output:
                 best_hypothesis = cluster_hypotheses[0]
                 deduplicated_hypotheses.append(best_hypothesis)
                 removed_count += len(cluster_hypotheses) - 1
+
+                # Track removed duplicates for analysis
+                removed_hypotheses = cluster_hypotheses[1:]
+                for removed_hy in removed_hypotheses:
+                    self.removed_duplicates.append({
+                        "cluster_id": cluster_id,
+                        "removed_hypothesis": removed_hy.to_dict(),
+                        "kept_hypothesis_text": best_hypothesis.text,
+                        "reason": f"Duplicate in high-similarity cluster (Elo: {removed_hy.elo_rating} vs {best_hypothesis.elo_rating})",
+                    })
+
                 logger.info(
                     f"Cluster {cluster_id}: Kept best hypothesis (Elo: {best_hypothesis.elo_rating}, Score: {best_hypothesis.score:.2f}), "
                     f"removed {len(cluster_hypotheses) - 1} duplicate(s)"
@@ -1767,8 +1953,8 @@ Example JSON Output:
 
         start_time = time.time()
         tournament_rounds = (
-            len(hypotheses) * 3
-        )  # 3 rounds per hypothesis
+            len(hypotheses) * 1
+        )  # 1 round per hypothesis (reduced from 3 for performance)
         k_factor = 24  # K-factor to control Elo update speed
 
         logger.info(
@@ -1933,6 +2119,18 @@ Example JSON Output:
         )
         self.start_time = time.time()
         self.hypotheses = []  # Reset hypotheses list for a new run
+        self.removed_duplicates = []  # Reset removed duplicates tracker
+
+        # Setup workflow logging directory
+        if self.save_workflow_logs:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            self.workflow_log_dir = self.base_path / f"workflow_{timestamp}"
+            self.workflow_log_dir.mkdir(exist_ok=True, parents=True)
+            logger.info(f"Workflow logs will be saved to: {self.workflow_log_dir}")
+
+            # Save research goal
+            with open(self.workflow_log_dir / "00_research_goal.txt", "w") as f:
+                f.write(research_goal)
 
         # Reset metrics while preserving structure
         self.execution_metrics = ExecutionMetrics(
@@ -1949,19 +2147,23 @@ Example JSON Output:
             self.hypotheses = self._run_generation_phase(
                 research_goal, progress_callback
             )
+            self._save_workflow_snapshot("01_generation")
 
             # --- Reflection Phase ---
             self.hypotheses = self._run_reflection_phase(
                 self.hypotheses, progress_callback
             )
+            self._save_workflow_snapshot("02_reflection")
 
             # --- Ranking Phase (Initial Ranking based on Reviews) ---
             self.hypotheses = self._run_ranking_phase(self.hypotheses, progress_callback)
+            self._save_workflow_snapshot("03_ranking")
 
             # --- Tournament Phase (Elo-based Ranking) ---
             self.hypotheses = self._run_tournament_phase(
                 self.hypotheses, progress_callback
             )
+            self._save_workflow_snapshot("04_tournament")
 
             # --- Iterative Refinement Cycle ---
             meta_review_data: Dict[str, Any] = {}
@@ -1974,32 +2176,57 @@ Example JSON Output:
                 meta_review_data = self._run_meta_review_phase(
                     self.hypotheses, progress_callback
                 )
+                self._save_workflow_snapshot(
+                    f"05_iter{iteration+1}_meta_review",
+                    {"meta_review_insights": meta_review_data}
+                )
 
                 # --- Evolution ---
-                top_hypotheses_for_evolution = self.hypotheses[
-                    : min(self.evolution_top_k, len(self.hypotheses))
-                ]  # Evolve top k
+                top_k = min(self.evolution_top_k, len(self.hypotheses))
+                top_hypotheses_for_evolution = self.hypotheses[:top_k]  # Evolve top k
                 logger.debug(
                     f"Evolving top {len(top_hypotheses_for_evolution)} hypotheses"
                 )
-                self.hypotheses = self._run_evolution_phase(
+                evolved_hypotheses = self._run_evolution_phase(
                     top_hypotheses_for_evolution, meta_review_data, progress_callback
                 )
+                # Merge evolved hypotheses back with non-evolved ones to prevent pool shrinkage
+                self.hypotheses = evolved_hypotheses + self.hypotheses[top_k:]
+                logger.debug(
+                    f"After evolution: {len(self.hypotheses)} total hypotheses ({len(evolved_hypotheses)} evolved, {len(self.hypotheses[top_k:])} unchanged)"
+                )
+                self._save_workflow_snapshot(f"06_iter{iteration+1}_evolution")
 
                 # Re-run Reflection and Ranking on evolved hypotheses
                 self.hypotheses = self._run_reflection_phase(
                     self.hypotheses, progress_callback
                 )
+                self._save_workflow_snapshot(f"07_iter{iteration+1}_reflection")
+
                 self.hypotheses = self._run_ranking_phase(
                     self.hypotheses, progress_callback
                 )
+                self._save_workflow_snapshot(f"08_iter{iteration+1}_ranking")
+
                 self.hypotheses = self._run_tournament_phase(
                     self.hypotheses, progress_callback
                 )  # Tournament after evolution too
+                self._save_workflow_snapshot(f"09_iter{iteration+1}_tournament")
 
                 # --- Proximity Analysis (after evolution and ranking each iteration) ---
+                before_proximity_count = len(self.hypotheses)
                 self.hypotheses = self._run_proximity_analysis_phase(
                     self.hypotheses, progress_callback
+                )
+                after_proximity_count = len(self.hypotheses)
+
+                self._save_workflow_snapshot(
+                    f"10_iter{iteration+1}_proximity",
+                    {
+                        "removed_duplicates": self.removed_duplicates,
+                        "hypotheses_before_dedup": before_proximity_count,
+                        "hypotheses_after_dedup": after_proximity_count,
+                    }
                 )
 
                 logger.success(f"Completed iteration {iteration + 1}")
@@ -2024,9 +2251,33 @@ Example JSON Output:
                 "execution_metrics": self.execution_metrics,
                 "total_workflow_time": total_time,
             }
+
+            # Save final complete workflow results
+            self._save_workflow_snapshot(
+                "99_final_results",
+                {
+                    "top_ranked_hypotheses": final_output_hypotheses,
+                    "meta_review_insights": meta_review_data,
+                    "all_removed_duplicates": self.removed_duplicates,
+                    "total_duplicates_removed": len(self.removed_duplicates),
+                }
+            )
+
+            # Save conversation history separately (can be very long)
+            if self.save_workflow_logs and self.workflow_log_dir:
+                try:
+                    history_file = self.workflow_log_dir / "conversation_history.txt"
+                    with open(history_file, "w") as f:
+                        f.write(self.conversation.return_history_as_string())
+                    logger.debug(f"Saved conversation history to: {history_file}")
+                except Exception as e:
+                    logger.error(f"Failed to save conversation history: {e}")
+
             logger.success(
                 f"Research workflow completed successfully in {total_time:.2f} seconds"
             )
+            if self.save_workflow_logs:
+                logger.info(f"Workflow logs saved to: {self.workflow_log_dir}")
             return final_output
 
         except Exception as e:
